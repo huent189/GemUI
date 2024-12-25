@@ -94,6 +94,8 @@ def gpt_cost(model, usage):
         return prompt_tokens, completion_tokens, cost 
     elif model == "gpt-4-1106-preview" or model == "gpt-4-1106":
         return (0.01 * usage.prompt_tokens + 0.03 * usage.completion_tokens) / 1000.0
+    elif model == "Qwen/Qwen2-VL-7B-Instruct":
+        return usage.prompt_tokens, usage.completion_tokens, 0
     else:
         print ("model not supported: ", model)
         return 0

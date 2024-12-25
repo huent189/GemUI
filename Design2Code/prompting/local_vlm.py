@@ -7,14 +7,15 @@ from openai import OpenAI, AzureOpenAI
 import argparse
 import retry
 import shutil 
-import vllm
 from vllm_controller import stop_vllm_server, start_vllm_server
 from time import sleep
+import time
+MODEL = 'Qwen/Qwen2-VL-7B-Instruct'
 @retry.retry(tries=3, delay=2)
-def qwenvl_call(openai_client, base64_image, prompt, json_output=False):
+def vllm_call(openai_client, base64_image, prompt, json_output=False):
     response_format = {"type": "json_object"} if json_output else {"type": "text"}
     response = openai_client.chat.completions.create(
-        model="Qwen/Qwen2-VL-7B-Instruct",
+        model=MODEL,
         messages=[
             {
                 "role": "user",
@@ -34,7 +35,8 @@ def qwenvl_call(openai_client, base64_image, prompt, json_output=False):
             }
         ],
         max_tokens=4096,
-        temperature=0.0,
+        temperature=0.5,
+        frequency_penalty=1.1,
         seed=2024,
         response_format = response_format
     )
@@ -46,9 +48,9 @@ def qwenvl_call(openai_client, base64_image, prompt, json_output=False):
     return response, prompt_tokens, completion_tokens, cost
 
 @retry.retry(tries=3, delay=2)
-def qwenvl_revision_call(openai_client, base64_image_ref, base64_image_pred, prompt):
+def vllm_revision_call(openai_client, base64_image_ref, base64_image_pred, prompt):
     response = openai_client.chat.completions.create(
-        model="Qwen/Qwen2-VL-7B-Instruct",
+        model=MODEL,
         messages=[
             {
                 "role": "user",
@@ -93,6 +95,7 @@ def qwenvl_revision_call(openai_client, base64_image_ref, base64_image_pred, pro
 
     return response, prompt_tokens, completion_tokens, cost
 
+
 def direct_prompting(openai_client, image_file):
     '''
     {original input image + prompt} -> {output html}
@@ -114,7 +117,7 @@ def direct_prompting(openai_client, image_file):
     base64_image = encode_image(image_file)
 
     ## call GPT-4V
-    html, prompt_tokens, completion_tokens, cost = qwenvl_call(openai_client, base64_image, direct_prompt)
+    html, prompt_tokens, completion_tokens, cost = vllm_call(openai_client, base64_image, direct_prompt)
 
     return html, prompt_tokens, completion_tokens, cost
 
@@ -146,35 +149,46 @@ def text_augmented_prompting(openai_client, image_file):
     base64_image = encode_image(image_file)
 
     ## call GPT-4V
-    html, prompt_tokens, completion_tokens, cost = qwenvl_call(openai_client, base64_image, text_augmented_prompt)
+    html, prompt_tokens, completion_tokens, cost = vllm_call(openai_client, base64_image, text_augmented_prompt)
 
     return html, prompt_tokens, completion_tokens, cost
-def analyze_then_gen_prompting(openai_client, image_file):
+def chat_with_openai(prompt,conversation_history):
+    # Append the user's message to the conversation history
+    conversation_history.append({"role": "user", "content": prompt})
+
+    # Call the OpenAI Chat Completion API
+    response = openai_client.chat.completions.create(
+        model=MODEL,
+        messages=conversation_history,
+        max_tokens=4096,
+        temperature=0.0,
+        frequency_penalty=0.1,
+        seed=2024
+    )
+
+    # Get the assistant's reply from the response
+    assistant_reply = response.choices[0].message.content.strip()
+
+    # Append the assistant's reply to the conversation history
+    conversation_history.append({"role": "assistant", "content": assistant_reply})
+
+    return assistant_reply
+def analyze_then_gen(openai_client, image_file):
     '''
     {original input image + extracted text + prompt} -> {output html}
     '''
-
-    ## extract all texts from the webpage 
-    with open(image_file.replace(".png", ".html"), "r") as f:
-        html_content = f.read()
-    texts = "\n".join(extract_text_from_html(html_content))
+    
 
     ## the prompt
     text_augmented_prompt = '''You are an expert web developer who specializes in HTML and CSS.
-A user will provide you with a screenshot of a webpage, along with all texts that they want to put on the webpage.
-The text elements are:
-''' + texts + '''.
-You now need to analyze the layout of the webpage and then generate a list of JSON objects that represent the layout structure of the webpage.
+A user will provide you with a screenshot of a webpage. You now need to analyze the layout of the webpage and then generate a list of JSON objects that represent the layout structure of the webpage. 
 Each JSON object should have the following format:
-
 {
-    "type": <type of element>,
-    "x": <x position>,
-    "y": <y position>,
-    "width": <width>,
-    "height": <height>,
-    "text": <text to be displayed if exists>,
-    "color": <color of the element>,
+    "type": <type of element such as block, image, button, link, text or logo>,
+    "position": <x y position of the element in pixels>,
+    "size": <size of the element in pixels>,
+    "color": <color of the element in natural language>,
+    "text": <text content of the element>,
     "children": [
         <list of child elements>
     ]
@@ -183,16 +197,123 @@ Note that:
 - The x and y positions are relative to the top-left corner of the webpage.
 - Some images on the webpage are replaced with a blue rectangle as the placeholder
 - Do not hallucinate any dependencies to external files
+- You should detect all images and text on the webpage, and put them in the correct places.
 Respond with the content of the json file (directly start with the code, do not add any additional explanation):
     '''
     text_augmented_prompt = text_augmented_prompt.strip()
     ## encode image 
+    
     base64_image = encode_image(image_file)
-
-    ## call GPT-4V
-    html, prompt_tokens, completion_tokens, cost = qwenvl_call(openai_client, base64_image, text_augmented_prompt)
-
-    return html, prompt_tokens, completion_tokens, cost
+    
+    conversation_history = []
+    json_output = chat_with_openai([
+                    {
+                        "type": "text", 
+                        "text": text_augmented_prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}",
+                            "detail": "high"
+                        },
+                    },
+                ],conversation_history)
+    
+    gen_html_prompt = '''Now based on the above description and the screenshot, you need to generate a single html file that uses HTML and CSS to reproduce the given website. You must include all CSS code in the HTML file itself.
+If it involves any images, use "rick.jpg" as the placeholder.
+Respond with the content of the HTML+CSS file (directly start with the code, do not add any additional explanation):
+'''
+    
+    html = chat_with_openai([
+        {"type": "text", 
+        "text": gen_html_prompt},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{base64_image}",
+                "detail": "high"
+            },
+        }
+    ], conversation_history)
+    
+    
+    html = cleanup_response(html)
+    return html, 0, 0, 0
+def analyze_then_gen_yaml(openai_client, image_file):
+    '''
+    {original input image + extracted text + prompt} -> {output html}
+    '''
+    
+    base64_image = encode_image(image_file)
+    
+    conversation_history = []
+    json_output = chat_with_openai([
+                    {
+                        "type": "text", 
+                        "text": 'Extract all the text on the webpage'
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}",
+                            "detail": "high"
+                        },
+                    },
+                ],conversation_history)
+    json_output = chat_with_openai([
+                    {
+                        "type": "text", 
+                        "text": 'How many images are there on the webpage?'
+                    }
+                ],conversation_history)
+    text_augmented_prompt = '''Analyze the user interface of the provided webpage, then provide an extremely detailed description capturing every aspect of the webpage including color schemes, typography, layout structures, navigation elements, forms, icons, spacing. 
+Respond with a YAML list of elements. Each element should follow this structure:
+```yaml
+- type: <type of element such as block, image, button, link, text, logo, navigation bar or other UI elements>
+  css_style: <describe color, font, size, position and other styles of the element>
+  text: <the text content of the element if any>
+  children:
+    - <list of child elements if any>
+```
+Note that:
+- Do not hallucinate any dependencies to external files
+- You should detect all images and text on the webpage, and put them in the correct orders.
+    '''
+    text_augmented_prompt = text_augmented_prompt.strip()
+    json_output = chat_with_openai([
+                    {
+                        "type": "text", 
+                        "text": text_augmented_prompt
+                    },
+                    # {
+                    #     "type": "image_url",
+                    #     "image_url": {
+                    #         "url": f"data:image/png;base64,{base64_image}",
+                    #         "detail": "high"
+                    #     },
+                    # },
+                ],conversation_history)
+    gen_html_prompt = '''Now based on the above description and the screenshot, you need to generate a single html file that uses HTML and CSS to reproduce the given website. You must include all CSS code in the HTML file itself.
+If it involves any images, use "rick.jpg" as the placeholder.
+Respond with the content of the HTML+CSS file (directly start with the code, do not add any additional explanation):
+'''
+    
+    html = chat_with_openai([
+        {"type": "text", 
+        "text": gen_html_prompt},
+        # {
+        #     "type": "image_url",
+        #     "image_url": {
+        #         "url": f"data:image/png;base64,{base64_image}",
+        #         "detail": "high"
+        #     },
+        # }
+    ], conversation_history)
+    
+    
+    html = cleanup_response(html)
+    return html, 0, 0, 0
 
 def visual_revision_prompting(openai_client, input_image_file, original_output_image):
     '''
@@ -222,7 +343,7 @@ def visual_revision_prompting(openai_client, input_image_file, original_output_i
     prompt += "Pay attention to things like size, text, position, and color of all the elements, as well as the overall layout.\n"
     prompt += "Respond directly with the content of the new revised and improved HTML file without any extra explanations:\n"
 
-    html, prompt_tokens, completion_tokens, cost = qwenvl_revision_call(openai_client, input_image, original_output_image, prompt)
+    html, prompt_tokens, completion_tokens, cost = vllm_revision_call(openai_client, input_image, original_output_image, prompt)
 
     return html, prompt_tokens, completion_tokens, cost
 
@@ -263,7 +384,7 @@ def layout_marker_prompting(openai_client, image_file, auto_insertion=False):
     text_augmented_prompt += "Respond with the content of the HTML+CSS file (directly start with the code, do not add any additional explanation):\n"
 
     ## call GPT-4V
-    html, prompt_tokens, completion_tokens, cost = qwenvl_call(openai_client, orig_input_image, text_augmented_prompt)
+    html, prompt_tokens, completion_tokens, cost = vllm_call(openai_client, orig_input_image, text_augmented_prompt)
 
     if auto_insertion:
         ## put texts back into marker positions 
@@ -291,7 +412,7 @@ def layout_marker_prompting(openai_client, image_file, auto_insertion=False):
         text_augmented_prompt += "Respond with the content of the HTML+CSS file (directly start with the code, do not add any additional explanation):\n"
 
         ## call GPT-4V
-        html, prompt_tokens, completion_tokens, cost = qwenvl_call(openai_client, orig_input_image, text_augmented_prompt)
+        html, prompt_tokens, completion_tokens, cost = vllm_call(openai_client, orig_input_image, text_augmented_prompt)
 
     # ## remove the marker files
     # os.remove(image_file.replace(".png", "_marker.html"))
@@ -302,14 +423,17 @@ def layout_marker_prompting(openai_client, image_file, auto_insertion=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--prompt_method', type=str, default='text_augmented_prompting', help='prompting method to be chosen from {direct_prompting, text_augmented_prompting, revision_prompting, layout_marker_prompting}')
-    parser.add_argument('--orig_output_dir', type=str, default='qwenvl_text_augmented_prompting', help='directory of the original output that will be further revised')
+    parser.add_argument('--orig_output_dir', type=str, default='vllm_text_augmented_prompting', help='directory of the original output that will be further revised')
     parser.add_argument('--file_name', type=str, default='all', help='any particular file to be tested')
     parser.add_argument('--subset', type=str, default='testset_100', help='evaluate on the full testset or just a subset (choose from: {testset_100, testset_full})')
     parser.add_argument('--take_screenshot', action="store_true", help='whether to render and take screenshot of the webpages')
     parser.add_argument('--auto_insertion', type=bool, default=False, help='whether to automatically insert texts into marker positions')
-    parser.add_argument('--rerun', type=bool, default=False, help='whether to automatically insert texts into marker positions')
+    parser.add_argument('--rerun', default=False, action="store_true")
+    parser.add_argument('--port', type=str, default='18999')
+    parser.add_argument('--model', type=str, default='Qwen/Qwen2-VL-7B-Instruct')
+    parser.add_argument('--model_name', type=str, default='qwenvl')
     args = parser.parse_args()
-
+    MODEL = args.model
     ## track usage
     if os.path.exists("usage.json"):
         with open("usage.json", 'r') as f:
@@ -322,12 +446,12 @@ if __name__ == "__main__":
         total_completion_tokens = 0 
         total_cost = 0
 
-    log_file = open('vllm.log', 'w', buffering=1)
-    vllm_process = start_vllm_server(log_file)
+    log_file = open(f'workdirs/vllm_{args.model_name}_{time.time()}.log', 'w', buffering=1)
+    vllm_process = start_vllm_server(log_file, port=args.port, model= args.model)
     api_key = "token-abc123s"
         
     openai_client = OpenAI(
-        base_url="http://localhost:18999/v1",
+        base_url=f"http://localhost:{args.port}/v1",
         api_key=api_key,
     )
     while(True):
@@ -355,13 +479,17 @@ if __name__ == "__main__":
             exit()
 
         if args.prompt_method == "direct_prompting":
-            predictions_dir = cache_dir + "qwenvl_direct_prompting"
+            predictions_dir = cache_dir + f"{args.model_name}_direct_prompting"
         elif args.prompt_method == "text_augmented_prompting":
-            predictions_dir = cache_dir + "qwenvl_text_augmented_prompting"
+            predictions_dir = cache_dir + f"{args.model_name}_text_augmented_prompting"
+        elif args.prompt_method == "analyze_then_gen":
+            predictions_dir = cache_dir + f"{args.model_name}_analyze_then_gen"
+        elif args.prompt_method == "analyze_then_gen_yaml":
+            predictions_dir = cache_dir + f"{args.model_name}_analyze_then_gen_yaml"
         elif args.prompt_method == "layout_marker_prompting":
-            predictions_dir = cache_dir + "qwenvl_layout_marker_prompting" + ("_auto_insertion" if args.auto_insertion else "") 
+            predictions_dir = cache_dir + f"{args.model_name}_layout_marker_prompting" + ("_auto_insertion" if args.auto_insertion else "") 
         elif args.prompt_method == "revision_prompting":
-            predictions_dir = cache_dir + "qwenvl_visual_revision_prompting"
+            predictions_dir = cache_dir + f"{args.model_name}_visual_revision_prompting"
             orig_data_dir = cache_dir + args.orig_output_dir
         else: 
             print ("Invalid prompt method!")
@@ -376,7 +504,7 @@ if __name__ == "__main__":
             test_files = [item for item in os.listdir(test_data_dir) if item.endswith(".png") and "_marker" not in item]
         else:
             test_files = [args.file_name]
-
+        test_files = sorted(test_files)[:20]
         for filename in tqdm(test_files):
             if filename.endswith(".png"):
                 print (filename)
@@ -393,6 +521,10 @@ if __name__ == "__main__":
                     html, prompt_tokens, completion_tokens, cost = visual_revision_prompting(openai_client, os.path.join(test_data_dir, filename), os.path.join(orig_data_dir, filename))
                 elif args.prompt_method == "layout_marker_prompting":
                     html, prompt_tokens, completion_tokens, cost = layout_marker_prompting(openai_client, os.path.join(test_data_dir, filename), auto_insertion=args.auto_insertion)
+                elif args.prompt_method == "analyze_then_gen":
+                    html, prompt_tokens, completion_tokens, cost = analyze_then_gen(openai_client, os.path.join(test_data_dir, filename))
+                elif args.prompt_method == "analyze_then_gen_yaml":
+                    html, prompt_tokens, completion_tokens, cost = analyze_then_gen_yaml(openai_client, os.path.join(test_data_dir, filename))
 
                 total_prompt_tokens += prompt_tokens
                 total_completion_tokens += completion_tokens
@@ -412,7 +544,7 @@ if __name__ == "__main__":
             "total_cost": total_cost
         }
 
-        with open("usage.json", 'w+') as f:
+        with open(f"usage_{args.model_name}_{args.prompt_method}.json", 'w+') as f:
             usage = json.dump(usage, f, indent=4)
     except KeyboardInterrupt:
         print("Program interrupted.")
